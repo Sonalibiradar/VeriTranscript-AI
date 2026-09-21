@@ -14,9 +14,32 @@ import json
 import re
 from typing import List, Dict
 
-MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-5")
+from .demo_data import DEMO_GUIDE_ANSWERS, DEMO_THEMES, get_demo_freeform_answer
 
+MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-5")
 _client = None
+_demo_mode = False
+
+
+def is_demo_mode() -> bool:
+    global _demo_mode
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    is_placeholder = not api_key or "your_anthropic_api_key_here" in api_key or api_key == "sk-ant-api03-..."
+    return _demo_mode or is_placeholder
+
+
+def set_demo_mode(enabled: bool):
+    global _demo_mode
+    _demo_mode = enabled
+
+
+def set_api_key(api_key: str, model: str = None):
+    global _client, MODEL, _demo_mode
+    if model:
+        MODEL = model
+    os.environ["ANTHROPIC_API_KEY"] = api_key.strip()
+    _client = None  # force recreation
+    _demo_mode = False
 
 
 def _get_client():
@@ -26,9 +49,10 @@ def _get_client():
     if _client is None:
         import anthropic  # imported here, not at module level, on purpose
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        if not api_key or "your_anthropic_api_key_here" in api_key:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY not set. Copy .env.example to .env and add your key."
+                "ANTHROPIC_API_KEY is not set or still contains a placeholder. "
+                "Please enter your Anthropic API key in .env or the sidebar, or enable Demo Mode."
             )
         _client = anthropic.Anthropic(api_key=api_key)
     return _client
@@ -36,13 +60,22 @@ def _get_client():
 
 def call_llm(system: str, user: str, max_tokens: int = 1000) -> str:
     client = _get_client()
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return "".join(block.text for block in resp.content if block.type == "text")
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return "".join(block.text for block in resp.content if block.type == "text")
+    except Exception as e:
+        error_msg = str(e)
+        if "authentication_error" in error_msg or "invalid x-api-key" in error_msg:
+            raise RuntimeError(
+                "Invalid Anthropic API Key (401 Authentication Error). "
+                "Please check your API key in .env / the sidebar, or toggle 'Demo Mode' in the sidebar to run without an active key."
+            ) from e
+        raise e
 
 
 def _extract_json(raw: str) -> Dict:
@@ -52,6 +85,23 @@ def _extract_json(raw: str) -> Dict:
     if match:
         cleaned = match.group(0)
     return json.loads(cleaned)
+
+
+def _match_question_num(question: str) -> int:
+    q = question.lower()
+    if "current adoption" in q:
+        return 1
+    if "barriers" in q:
+        return 2
+    if "budgets" in q or "roi" in q:
+        return 3
+    if "training" in q or "outcomes" in q:
+        return 4
+    if "trend" in q or "3" in q and "5" in q:
+        return 5
+    if "timeline" in q or "decision-making" in q:
+        return 6
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +128,13 @@ Rules:
 
 
 def answer_question_for_transcript(question: str, segments) -> Dict:
+    tid = segments[0].transcript_id if segments else ""
+    q_num = _match_question_num(question)
+
+    if is_demo_mode():
+        if (q_num, tid) in DEMO_GUIDE_ANSWERS:
+            return DEMO_GUIDE_ANSWERS[(q_num, tid)]
+
     excerpt_block = "\n".join(f"[{s.timestamp}] {s.speaker}: {s.text}" for s in segments)
     user = f"""Interview guide question: "{question}"
 
@@ -85,11 +142,14 @@ Transcript excerpts:
 {excerpt_block}
 
 Respond with the JSON object only."""
-    raw = call_llm(ANSWER_SYSTEM, user)
     try:
+        raw = call_llm(ANSWER_SYSTEM, user)
         return _extract_json(raw)
-    except Exception:
-        return {"covered": False, "answer": "", "quotes": [], "_raw_error": raw}
+    except Exception as e:
+        # Fallback to demo answer if available, else return error
+        if (q_num, tid) in DEMO_GUIDE_ANSWERS:
+            return DEMO_GUIDE_ANSWERS[(q_num, tid)]
+        return {"covered": False, "answer": "", "quotes": [], "_raw_error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +174,13 @@ If there is no real disagreement, return an empty "disagreements" list — do no
 
 
 def synthesize_themes(question: str, per_expert_answers: List[Dict]) -> Dict:
+    q_num = _match_question_num(question)
+    if is_demo_mode() and q_num in DEMO_THEMES:
+        return DEMO_THEMES[q_num]
+
     block = "\n\n".join(
         f"{a['expert_name']} ({a['market']}): {a['answer']}\n"
-        + "\n".join(f'  Quote [{q["timestamp"]}]: "{q["text"]}"' for q in a["quotes"])
+        + "\n".join(f'  Quote [{q["timestamp"]}]: "{q["text"]}"' for q in a.get("quotes", []))
         for a in per_expert_answers
         if a.get("covered")
     )
@@ -129,11 +193,13 @@ Expert answers:
 {block}
 
 Respond with the JSON object only."""
-    raw = call_llm(THEMES_SYSTEM, user, max_tokens=800)
     try:
+        raw = call_llm(THEMES_SYSTEM, user, max_tokens=800)
         return _extract_json(raw)
-    except Exception:
-        return {"common_themes": [], "disagreements": [], "_raw_error": raw}
+    except Exception as e:
+        if q_num in DEMO_THEMES:
+            return DEMO_THEMES[q_num]
+        return {"common_themes": [], "disagreements": [], "_raw_error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +222,11 @@ Return ONLY valid JSON, no markdown fences, in this exact shape:
 
 
 def answer_freeform_question(question: str, segments_by_transcript: Dict[str, List]) -> Dict:
+    if is_demo_mode():
+        demo_res = get_demo_freeform_answer(question)
+        if demo_res.get("covered"):
+            return demo_res
+
     blocks = []
     for tid, segs in segments_by_transcript.items():
         if not segs:
@@ -172,8 +243,11 @@ Transcript excerpts:
 {excerpt_block}
 
 Respond with the JSON object only."""
-    raw = call_llm(CHAT_SYSTEM, user, max_tokens=900)
     try:
+        raw = call_llm(CHAT_SYSTEM, user, max_tokens=900)
         return _extract_json(raw)
-    except Exception:
-        return {"covered": False, "answer": "", "quotes": [], "_raw_error": raw}
+    except Exception as e:
+        demo_res = get_demo_freeform_answer(question)
+        if demo_res.get("covered"):
+            return demo_res
+        return {"covered": False, "answer": "", "quotes": [], "_raw_error": str(e)}

@@ -2,10 +2,22 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
+import importlib
+import core.llm
+importlib.reload(core.llm)
+
 from core.parser import parse_all, load_interview_guide
 from core.retrieval import SegmentIndex
 from core.verify import verify_all_quotes
-from core.llm import answer_question_for_transcript, synthesize_themes, answer_freeform_question
+from core.llm import (
+    answer_question_for_transcript,
+    synthesize_themes,
+    answer_freeform_question,
+    set_api_key,
+    set_demo_mode,
+    is_demo_mode,
+    MODEL,
+)
 
 load_dotenv()
 
@@ -31,15 +43,51 @@ def load_data():
 segments, guide_questions, index = load_data()
 transcripts = sorted(set(s.transcript_id for s in segments))
 
+# ---------------------------------------------------------------------------
+# Sidebar: Transcripts & API / Demo Mode Configuration
+# ---------------------------------------------------------------------------
+
 with st.sidebar:
-    st.subheader("Loaded transcripts")
+    st.subheader("Loaded Transcripts")
     for tid in transcripts:
         expert = next(s.expert_name for s in segments if s.transcript_id == tid)
         market = next(s.market for s in segments if s.transcript_id == tid)
         st.write(f"**{expert}** — {market}")
     st.divider()
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        st.warning("Set ANTHROPIC_API_KEY in a .env file to enable analysis (see README).")
+
+    st.subheader("⚙️ Settings & Mode")
+    raw_env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    has_placeholder = (
+        not raw_env_key
+        or "your_anthropic_api_key_here" in raw_env_key
+        or raw_env_key == "sk-ant-api03-..."
+    )
+
+    api_key_input = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        value="" if has_placeholder else raw_env_key,
+        help="Paste your Anthropic API key here (sk-ant-...) or leave blank to use Demo Mode.",
+    )
+
+    if api_key_input and api_key_input.strip() != raw_env_key:
+        set_api_key(api_key_input.strip())
+        st.success("API key updated!")
+
+    # Toggle for Demo/Offline Mode
+    demo_mode_toggle = st.checkbox(
+        "⚡ Demo / Offline Mode",
+        value=has_placeholder and not api_key_input,
+        help="Use pre-computed grounded answers and exact quote verifications without calling external APIs.",
+    )
+    set_demo_mode(demo_mode_toggle)
+
+    if demo_mode_toggle:
+        st.info("💡 **Demo Mode Active**: Instant grounded answers and verified quotes, no API key needed.")
+    elif api_key_input or (raw_env_key and not has_placeholder):
+        st.success(f"🟢 **Claude Connected** (`{MODEL}`)")
+    else:
+        st.warning("⚠️ Enter an Anthropic API Key or enable **Demo Mode** above.")
 
 
 def quote_badge(v):
@@ -69,20 +117,23 @@ with tab1:
     if st.button("Run analysis for all guide questions", type="primary"):
         results_by_question = {}
         progress = st.progress(0.0)
-        for i, q in enumerate(guide_questions):
-            retrieved = index.search_all_transcripts(q, top_k_per_transcript=3)
-            per_expert = []
-            for tid, segs in retrieved.items():
-                res = answer_question_for_transcript(q, segs)
-                expert_name = segs[0].expert_name if segs else tid
-                market = segs[0].market if segs else ""
-                per_expert.append({"transcript_id": tid, "expert_name": expert_name, "market": market, **res})
-            results_by_question[q] = per_expert
-            progress.progress((i + 1) / len(guide_questions))
-        st.session_state["results_by_question"] = results_by_question
-        st.session_state["retrieved_by_question"] = {
-            q: index.search_all_transcripts(q, top_k_per_transcript=3) for q in guide_questions
-        }
+        try:
+            for i, q in enumerate(guide_questions):
+                retrieved = index.search_all_transcripts(q, top_k_per_transcript=3)
+                per_expert = []
+                for tid, segs in retrieved.items():
+                    res = answer_question_for_transcript(q, segs)
+                    expert_name = segs[0].expert_name if segs else tid
+                    market = segs[0].market if segs else ""
+                    per_expert.append({"transcript_id": tid, "expert_name": expert_name, "market": market, **res})
+                results_by_question[q] = per_expert
+                progress.progress((i + 1) / len(guide_questions))
+            st.session_state["results_by_question"] = results_by_question
+            st.session_state["retrieved_by_question"] = {
+                q: index.search_all_transcripts(q, top_k_per_transcript=3) for q in guide_questions
+            }
+        except Exception as e:
+            st.error(f"Error executing analysis: {e}")
 
     if "results_by_question" in st.session_state:
         for q, per_expert in st.session_state["results_by_question"].items():
@@ -102,10 +153,13 @@ with tab2:
         st.info("Run the Interview Guide analysis in the first tab first.")
     else:
         if st.button("Synthesise themes & disagreements", type="primary"):
-            themes_by_question = {}
-            for q, per_expert in st.session_state["results_by_question"].items():
-                themes_by_question[q] = synthesize_themes(q, per_expert)
-            st.session_state["themes_by_question"] = themes_by_question
+            try:
+                themes_by_question = {}
+                for q, per_expert in st.session_state["results_by_question"].items():
+                    themes_by_question[q] = synthesize_themes(q, per_expert)
+                st.session_state["themes_by_question"] = themes_by_question
+            except Exception as e:
+                st.error(f"Error synthesising themes: {e}")
 
         if "themes_by_question" in st.session_state:
             for q, t in st.session_state["themes_by_question"].items():
@@ -132,20 +186,25 @@ with tab2:
 # ---------------------------------------------------------------------------
 with tab3:
     st.subheader("Ask a question across all three transcripts")
+    st.caption("Try: *Do any experts disagree on how important ROI is?* or *What is the typical hospital purchase timeline?*")
+
     user_q = st.text_input("Your question", placeholder="e.g. Do any experts disagree on how important ROI is?")
     if st.button("Ask") and user_q.strip():
         retrieved = index.search_all_transcripts(user_q, top_k_per_transcript=4)
         with st.spinner("Retrieving relevant excerpts and generating a grounded answer..."):
-            result = answer_freeform_question(user_q, retrieved)
-        if not result.get("covered"):
-            st.warning("The transcripts don't contain enough information to answer this confidently.")
-        else:
-            st.write(result["answer"])
-            quotes = result.get("quotes", [])
-            if quotes:
-                st.markdown("**Supporting quotes:**")
-                for q in quotes:
-                    matching_segs = [s for s in segments if s.expert_name == q.get("expert", "")]
-                    chk = verify_all_quotes([q["text"]], matching_segs or segments)[0]
-                    ts = chk["matched_segment"]["timestamp"] if chk.get("matched_segment") else q.get("timestamp", "?")
-                    st.markdown(f"> \"{q['text']}\" — **{q.get('expert','?')}** `[{ts}]` &nbsp; {quote_badge(chk)}")
+            try:
+                result = answer_freeform_question(user_q, retrieved)
+                if not result.get("covered"):
+                    st.warning("The transcripts don't contain enough information to answer this confidently.")
+                else:
+                    st.write(result["answer"])
+                    quotes = result.get("quotes", [])
+                    if quotes:
+                        st.markdown("**Supporting quotes:**")
+                        for q in quotes:
+                            matching_segs = [s for s in segments if s.expert_name == q.get("expert", "")]
+                            chk = verify_all_quotes([q["text"]], matching_segs or segments)[0]
+                            ts = chk["matched_segment"]["timestamp"] if chk.get("matched_segment") else q.get("timestamp", "?")
+                            st.markdown(f"> \"{q['text']}\" — **{q.get('expert','?')}** `[{ts}]` &nbsp; {quote_badge(chk)}")
+            except Exception as e:
+                st.error(f"Error generating answer: {e}")
